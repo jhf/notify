@@ -8,6 +8,7 @@
 package notify
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 )
@@ -75,7 +76,7 @@ Test:
 			t.Log("skipped")
 			continue
 		}
-		w := &watch{prev: make(map[string]uint32)}
+		w := &watch{}
 		for j, cas := range cas {
 			if diff := w.strip(cas.path, cas.flag); diff != cas.diff {
 				t.Errorf("want diff=%v; got %v (i=%d, j=%d)", Event(cas.diff),
@@ -83,6 +84,105 @@ Test:
 				continue Test
 			}
 		}
+	}
+}
+
+// fillHistory records the creation of n other paths.
+func fillHistory(w *watch, prefix string, n int) {
+	for i := 0; i < n; i++ {
+		w.strip(fmt.Sprintf("%s/%d", prefix, i), uint32(FSEventsCreated))
+	}
+}
+
+func TestWatchStripHistory(t *testing.T) {
+	const (
+		create = uint32(FSEventsCreated)
+		remove = uint32(FSEventsRemoved)
+		write  = uint32(FSEventsModified)
+	)
+	cases := [...]struct {
+		name       string
+		setup      []uint32
+		next       uint32
+		remembered uint32
+		forgotten  uint32
+	}{
+		{"created", []uint32{create}, create | write, write, create | write},
+		{"removed", []uint32{create, create | remove}, create | remove, create, create | remove},
+	}
+	for _, cas := range cases {
+		// Where the path lands in its generation must not matter.
+		for _, offset := range []int{0, 1, historyLen / 2, historyLen - 1} {
+			for _, other := range []struct {
+				n    int
+				want uint32
+			}{
+				{historyLen, cas.remembered},
+				{2 * historyLen, cas.forgotten},
+			} {
+				w := &watch{}
+				fillHistory(w, "before", offset)
+				for _, flags := range cas.setup {
+					w.strip("file", flags)
+				}
+				fillHistory(w, "after", other.n)
+				if diff := w.strip("file", cas.next); diff != other.want {
+					t.Errorf("%s, offset %d, %d other paths: want diff=%v; got %v",
+						cas.name, offset, other.n, Event(other.want), Event(diff))
+				}
+			}
+		}
+	}
+
+	// A path that keeps changing must never be forgotten.
+	w := &watch{}
+	w.strip("file", create)
+	for i := 0; i < 8; i++ {
+		fillHistory(w, fmt.Sprintf("round%d", i), historyLen/2+1)
+		if diff := w.strip("file", create|write); diff != write {
+			t.Fatalf("round %d: want diff=%v; got %v", i, Event(write), Event(diff))
+		}
+	}
+}
+
+func TestWatchDispatchBoundedHistory(t *testing.T) {
+	c := make(chan EventInfo, 128)
+	got := make(chan map[Event]int)
+	go func() {
+		count := make(map[Event]int)
+		for ei := range c {
+			count[ei.Event()]++
+		}
+		got <- count
+	}()
+	w := &watch{
+		c:      c,
+		path:   "/watched",
+		events: uint32(Create | Remove | Rename),
+		isrec:  1,
+	}
+	w.Dispatch([]FSEvent{{Path: "/watched", Flags: uint32(FSEventsHistoryDone)}})
+	const n = 4 * historyLen
+	for i := 0; i < n; i++ {
+		// A temporary file that is removed, and one that is renamed into
+		// place elsewhere, as build tools and downloaders do.
+		tmp := fmt.Sprintf("/watched/build/%d.o", i)
+		part := fmt.Sprintf("/watched/downloads/%d.part", i)
+		w.Dispatch([]FSEvent{
+			{Path: tmp, Flags: uint32(FSEventsCreated | FSEventsIsFile)},
+			{Path: part, Flags: uint32(FSEventsCreated | FSEventsIsFile)},
+			{Path: tmp, Flags: uint32(FSEventsCreated | FSEventsRemoved | FSEventsIsFile)},
+			{Path: part, Flags: uint32(FSEventsCreated | FSEventsRenamed | FSEventsIsFile)},
+		})
+		if size := len(w.prev.cur) + len(w.prev.old); size > 2*historyLen {
+			t.Fatalf("history holds %d paths after %d files; want at most %d",
+				size, 2*(i+1), 2*historyLen)
+		}
+	}
+	close(c)
+	want := map[Event]int{Create: 2 * n, Remove: n, Rename: n}
+	if count := <-got; !reflect.DeepEqual(count, want) {
+		t.Errorf("want events %v; got %v", want, count)
 	}
 }
 

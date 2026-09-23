@@ -37,15 +37,57 @@ func splitflags(set uint32) (e []uint32) {
 	return
 }
 
+// historyLen is the number of paths in each of the two generations of a
+// watch's history, so a watch remembers at most 2*historyLen paths.
+//
+// fseventsd merges the flags of all events for a path into one in-memory
+// record, and repeats them in every later event for that path until it writes
+// the record out. It writes its records out once it has collected 2730 of them
+// (measured on macOS 26), and often sooner. Once historyLen other paths have
+// changed since a path last did, fseventsd no longer repeats old flags for it,
+// so strip can forget the path.
+const historyLen = 8192
+
+// history remembers the last Created or Removed state that strip saw for each
+// path. New states go into the current generation. When that is full, it
+// becomes the previous generation and the one before it is dropped, so a path
+// is remembered until at least historyLen other paths have been recorded after
+// its last event.
+type history struct {
+	cur, old map[string]uint32
+}
+
+func (h *history) get(path string) uint32 {
+	if state, ok := h.cur[path]; ok {
+		return state
+	}
+	return h.old[path]
+}
+
+func (h *history) set(path string, state uint32) {
+	s, ok := h.cur[path]
+	if ok && s == state {
+		return
+	}
+	if !ok && len(h.cur) >= historyLen {
+		h.old, h.cur = h.cur, nil
+	}
+	if h.cur == nil {
+		h.cur = make(map[string]uint32)
+	}
+	// Copy the path, which usually shares memory with the full event path
+	// and would otherwise keep all of it allocated.
+	h.cur[string([]byte(path))] = state
+}
+
 // watch represents a filesystem watchpoint. It is a higher level abstraction
 // over FSEvents' stream, which implements filtering of file events based
 // on path and event set. It emulates non-recursive watch-point by filtering out
 // events which paths are more than 1 level deeper than the watched path.
 type watch struct {
-	// prev stores last event set  per path in order to filter out old flags
-	// for new events, which appratenly FSEvents likes to retain. It's a disgusting
-	// hack, it should be researched how to get rid of it.
-	prev    map[string]uint32
+	// prev stores the Created or Removed state of recently changed paths, in
+	// order to filter out the old flags FSEvents repeats in later events.
+	prev    history
 	c       chan<- EventInfo
 	stream  *stream
 	path    string
@@ -89,26 +131,33 @@ func (w *watch) strip(base string, set uint32) uint32 {
 		write = FSEventsModified | FSEventsInodeMetaMod
 		both  = FSEventsCreated | FSEventsRemoved
 	)
-	switch w.prev[base] {
+	prev := w.prev.get(base)
+	next := prev
+	switch prev {
 	case FSEventsCreated:
 		set &^= FSEventsCreated
 		if set&FSEventsRemoved != 0 {
-			w.prev[base] = FSEventsRemoved
+			next = FSEventsRemoved
 			set &^= write
 		}
 	case FSEventsRemoved:
 		set &^= FSEventsRemoved
 		if set&FSEventsCreated != 0 {
-			w.prev[base] = FSEventsCreated
+			next = FSEventsCreated
 		}
 	default:
 		switch set & both {
 		case FSEventsCreated:
-			w.prev[base] = FSEventsCreated
+			next = FSEventsCreated
 		case FSEventsRemoved:
-			w.prev[base] = FSEventsRemoved
+			next = FSEventsRemoved
 			set &^= write
 		}
+	}
+	// Set the state even when it is unchanged, so that a path which keeps
+	// changing stays in the current generation.
+	if next != 0 {
+		w.prev.set(base, next)
 	}
 	dbgprintf("split()=%v\n", Event(set))
 	return set
@@ -148,7 +197,7 @@ func (w *watch) Dispatch(ev []FSEvent) {
 			}
 		}
 		// TODO(rjeczalik): get diff only from filtered events?
-		e := w.strip(string(base), ev[i].Flags) & events
+		e := w.strip(base, ev[i].Flags) & events
 		if e == 0 {
 			continue
 		}
@@ -191,7 +240,6 @@ func (fse *fsevents) watch(path string, event Event, isrec int32) (err error) {
 		return errAlreadyWatched
 	}
 	w := &watch{
-		prev:   make(map[string]uint32),
 		c:      fse.c,
 		path:   path,
 		events: uint32(event),
