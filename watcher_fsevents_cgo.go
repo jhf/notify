@@ -39,6 +39,52 @@ var (
 	since   = uint64(C.FSEventsGetCurrentEventId())
 )
 
+// replayHistorical gates processing of events that arrive before
+// FSEventsHistoryDone. Those are historical journal events, delivered when a
+// stream is created with a since-ID in the past; the library default of
+// dropping them preserves the semantics of Watch (events after the call).
+// SetSinceEventID turns processing on, because historical events are exactly
+// what a caller seeding a journal position wants.
+var replayHistorical atomic.Bool
+
+// SetSinceEventID seeds the journal position used by streams started after
+// the call. The seed only ever moves backwards: the minimum of the current
+// and given values wins, so concurrent callers (e.g. multiple watched trees
+// with their own persisted positions) cannot accidentally raise each other's
+// position and lose events. It also enables processing of historical events
+// (see replayHistorical). Call before starting the first stream; streams read
+// the seed when they are started.
+func SetSinceEventID(id uint64) {
+	if id == 0 {
+		return
+	}
+	for {
+		cur := atomic.LoadUint64(&since)
+		if id >= cur || atomic.CompareAndSwapUint64(&since, cur, id) {
+			break
+		}
+	}
+	replayHistorical.Store(true)
+}
+
+// ResetSinceEventID abandons journal replay: the seed is raised to the
+// current event ID and historical events are dropped again. Callers use this
+// when the journal turns out not to cover the seeded position (signalled by
+// FSEventsMustScanSubDirs and friends), to prevent a restarted stream from
+// replaying the same failure in a loop.
+func ResetSinceEventID() {
+	replayHistorical.Store(false)
+	atomic.StoreUint64(&since, uint64(C.FSEventsGetCurrentEventId()))
+}
+
+// CurrentEventID returns the current event ID of the FSEvents journal, i.e.
+// the ID the next recorded event will get. A persisted seed greater than this
+// means the journal was reset (e.g. the volume was reformatted) and the seed
+// is meaningless.
+func CurrentEventID() uint64 {
+	return uint64(C.FSEventsGetCurrentEventId())
+}
+
 // global dispatch queue which all streams are registered with
 var q C.dispatch_queue_t = C.dispatch_queue_create(
 	C.CString("com.github.rjeczalik.notify"),
@@ -70,6 +116,14 @@ func gostream(_, info uintptr, n C.size_t, paths, flags, ids uintptr) {
 		switch flags := *(*uint32)(unsafe.Pointer((flags + i*offflag))); {
 		case flags&uint32(FSEventsEventIdsWrapped) != 0:
 			atomic.StoreUint64(&since, uint64(C.FSEventsGetCurrentEventId()))
+			// Surface the wrap as an event: it means journal positions are no
+			// longer comparable, which a replaying consumer must treat as a
+			// journal failure and fall back to a full scan.
+			ev = append(ev, FSEvent{
+				Path:  C.GoString(*(**C.char)(unsafe.Pointer(paths + i*offchar))),
+				Flags: flags,
+				ID:    *(*uint64)(unsafe.Pointer(ids + i*offid)),
+			})
 		default:
 			ev = append(ev, FSEvent{
 				Path:  C.GoString(*(**C.char)(unsafe.Pointer(paths + i*offchar))),

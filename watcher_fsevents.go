@@ -124,7 +124,7 @@ func (w *watch) Dispatch(ev []FSEvent) {
 			w.flushed = true
 			continue
 		}
-		if !w.flushed {
+		if !w.flushed && !replayHistorical.Load() {
 			continue
 		}
 		dbgprintf("%v (0x%x) (%s, i=%d, ID=%d, len=%d)\n", Event(ev[i].Flags),

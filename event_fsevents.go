@@ -66,6 +66,12 @@ type event struct {
 	event Event
 }
 
+// EventID returns the FSEvents journal ID of the event. It lets consumers
+// persist their journal position and resume from it later (see
+// SetSinceEventID). It satisfies an anonymous interface assertion so that
+// consumers build-tagged for other platforms can probe for it.
+func (e *FSEvent) EventID() uint64 { return e.ID }
+
 func (ei *event) Event() Event         { return ei.event }
 func (ei *event) Path() string         { return ei.fse.Path }
 func (ei *event) Sys() interface{}     { return &ei.fse }
