@@ -8,6 +8,7 @@
 package notify
 
 import (
+	"time"
 	"fmt"
 	"reflect"
 	"testing"
@@ -146,7 +147,12 @@ func TestWatchStripHistory(t *testing.T) {
 }
 
 func TestWatchDispatchBoundedHistory(t *testing.T) {
-	c := make(chan EventInfo, 128)
+	// The channel must be large enough to hold every event: Dispatch no
+	// longer blocks on a full channel (it drops and emits a synthetic
+	// MustScanSubDirs instead), so a small buffer would lose events here.
+	// Full delivery when the consumer keeps up is part of what this test
+	// pins down, alongside history bounding.
+	c := make(chan EventInfo, 8*historyLen+1024)
 	got := make(chan map[Event]int)
 	go func() {
 		count := make(map[Event]int)
@@ -209,4 +215,55 @@ func TestWatcherShadowedWriteCreate(t *testing.T) {
 	}
 
 	w.ExpectAny(cases[:5]) // BUG(rjeczalik): #62
+}
+
+func TestDispatchDropsWithSyntheticFlag(t *testing.T) {
+	// A full consumer channel must not block Dispatch (it runs on the serial
+	// fseventsd delivery queue); dropped events must surface as one synthetic
+	// MustScanSubDirs event for the watched root.
+	c := make(chan EventInfo, 4)
+	w := &watch{
+		c:       c,
+		path:    "/watched",
+		events:  uint32(FSEventsCreated | FSEventsModified),
+		isrec:   1,
+		flushed: true,
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// 8 fresh paths, one Created send each, into a 4-buffer with no
+		// consumer: must not block.
+		for i := 0; i < 8; i++ {
+			w.Dispatch([]FSEvent{{Path: fmt.Sprintf("/watched/f%d", i), Flags: FSEventsCreated}})
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Dispatch blocked on a full consumer channel")
+	}
+	if w.dropped.Load() == 0 {
+		t.Fatal("expected dropped event count > 0")
+	}
+	// Drain two slots; the next Dispatch must emit the synthetic flag,
+	// followed by its own event.
+	<-c
+	<-c
+	w.Dispatch([]FSEvent{{Path: "/watched/g", Flags: FSEventsCreated}})
+	<-c // f2
+	<-c // f3
+	ei := <-c
+	if ei.Event()&FSEventsMustScanSubDirs == 0 {
+		t.Fatalf("want synthetic MustScanSubDirs after drops, got %v", ei.Event())
+	}
+	if ei.Path() != "/watched" {
+		t.Fatalf("want synthetic event on watch root, got %q", ei.Path())
+	}
+	if ei := <-c; ei.Event() != Create || ei.Path() != "/watched/g" {
+		t.Fatalf("want Create /watched/g after synthetic, got %v %q", ei.Event(), ei.Path())
+	}
+	if w.dropped.Load() != 0 {
+		t.Fatalf("dropped count not reset: %d", w.dropped.Load())
+	}
 }

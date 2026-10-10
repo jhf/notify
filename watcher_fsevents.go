@@ -94,6 +94,12 @@ type watch struct {
 	events  uint32
 	isrec   int32
 	flushed bool
+	// dropped counts events Dispatch could not hand to the consumer because
+	// the channel was full. The next successful send is preceded by one
+	// synthetic MustScanSubDirs event for the watched root, so the consumer
+	// rescans instead of silently missing the dropped events (the same
+	// contract fseventsd itself uses).
+	dropped atomic.Int64
 }
 
 // Example format:
@@ -163,9 +169,35 @@ func (w *watch) strip(base string, set uint32) uint32 {
 	return set
 }
 
+// flushDropped emits one synthetic MustScanSubDirs event for the watched
+// root if earlier Dispatch sends found the consumer channel full. If the
+// channel is still full the count is kept and the next Dispatch retries, so
+// the signal is never lost.
+func (w *watch) flushDropped() {
+	if w.dropped.Load() == 0 {
+		return
+	}
+	select {
+	case w.c <- &event{
+		fse:   FSEvent{Path: w.path, Flags: uint32(FSEventsMustScanSubDirs)},
+		event: FSEventsMustScanSubDirs,
+	}:
+		w.dropped.Store(0)
+	default:
+	}
+}
+
 // Dispatch is a stream function which forwards given file events for the watched
 // path to underlying FileInfo channel.
+//
+// Sends are non-blocking: Dispatch runs on the serial dispatch queue that
+// fseventsd delivers to, and a blocking send stalls that queue, which makes
+// fseventsd drop events for the stream and flag later events with
+// MustScanSubDirs/UserDropped - each of which costs the consumer a full
+// rescan. Dropping here with a synthetic flag (flushDropped) keeps the queue
+// flowing and collapses a drop storm into a single rescan signal.
 func (w *watch) Dispatch(ev []FSEvent) {
+	w.flushDropped()
 	events := atomic.LoadUint32(&w.events)
 	isrec := (atomic.LoadInt32(&w.isrec) == 1)
 	for i := range ev {
@@ -203,12 +235,17 @@ func (w *watch) Dispatch(ev []FSEvent) {
 		}
 		for _, e := range splitflags(e) {
 			dbgprintf("%d: single event: %v", ev[i].ID, Event(e))
-			w.c <- &event{
+			select {
+			case w.c <- &event{
 				fse:   ev[i],
 				event: Event(e),
+			}:
+			default:
+				w.dropped.Add(1)
 			}
 		}
 	}
+	w.flushDropped()
 }
 
 // Stop closes underlying FSEvents stream and stops dispatching events.
