@@ -270,9 +270,11 @@ func TestDispatchDropsWithSyntheticFlag(t *testing.T) {
 
 func TestDispatchHealsUserDroppedByReplay(t *testing.T) {
 	// A live UserDropped flag must restart the stream replaying from the
-	// last examined event ID, must not be forwarded (the consumer must not
-	// full-scan), and records re-delivered by the heal replay must have
-	// their latched drop flags stripped while keeping real content.
+	// last examined event ID, and must not be forwarded (the consumer must
+	// not full-scan). Drop flags are delivery-time annotations, so a flagged
+	// record arriving via the heal replay marks a FRESH hole in that
+	// delivery: it is stripped and collected, and HistoryDone starts one
+	// follow-up replay from the hole start.
 	replayHistorical.Store(true)
 	defer replayHistorical.Store(false)
 
@@ -304,20 +306,32 @@ func TestDispatchHealsUserDroppedByReplay(t *testing.T) {
 	if w.live {
 		t.Fatal("watch still live after heal")
 	}
-	// Heal replay: a plain historical event, then the flagged record itself
-	// (ID <= target: flags stripped, content kept), then HistoryDone.
+	// Heal replay: a plain historical event, then the flagged record again -
+	// a FRESH hole in this delivery, stripped and deferred - then
+	// HistoryDone, which starts the follow-up heal from 101.
 	w.Dispatch([]FSEvent{
 		{Path: "/watched/c", Flags: uint32(FSEventsCreated | FSEventsIsFile), ID: 101},
 		{Path: "/watched/b", Flags: ud | uint32(FSEventsCreated|FSEventsIsFile), ID: 105},
 		{Flags: uint32(FSEventsHistoryDone), ID: 106},
 	})
+	if heals != 2 || healFrom != 101 {
+		t.Fatalf("want follow-up heal from ID 101, got heals=%d from=%d", heals, healFrom)
+	}
+	if w.live {
+		t.Fatal("watch must not be live during the follow-up replay")
+	}
+	// The follow-up replay is clean; HistoryDone restores live.
+	w.Dispatch([]FSEvent{
+		{Path: "/watched/b", Flags: uint32(FSEventsCreated | FSEventsIsFile), ID: 105},
+		{Flags: uint32(FSEventsHistoryDone), ID: 106},
+	})
 	if !w.live {
-		t.Fatal("watch not live after HistoryDone")
+		t.Fatal("watch not live after clean follow-up HistoryDone")
 	}
 	// A second live drop heals again, from the last examined ID.
 	w.Dispatch([]FSEvent{{Path: "/watched/d", Flags: ud, ID: 200}})
-	if heals != 2 || healFrom != 105 {
-		t.Fatalf("want second heal from ID 105, got heals=%d from=%d", heals, healFrom)
+	if heals != 3 || healFrom != 105 {
+		t.Fatalf("want third heal from ID 105, got heals=%d from=%d", heals, healFrom)
 	}
 
 	close(c)
@@ -325,6 +339,8 @@ func TestDispatchHealsUserDroppedByReplay(t *testing.T) {
 	for ei := range c {
 		got = append(got, ei.Event().String()+" "+ei.Path())
 	}
+	// The clean re-delivery of /watched/b in the follow-up replay is
+	// suppressed by strip's create-after-create dedup, so b appears once.
 	want := []string{
 		"notify.Create /watched/a",
 		"notify.Create /watched/c",
@@ -422,18 +438,19 @@ func TestDispatchHealsMidReplayFlag(t *testing.T) {
 	if w.live {
 		t.Fatal("watch must not be live during the follow-up replay")
 	}
-	// The follow-up replay re-delivers the range; flagged records with
-	// ID <= target are stripped, then HistoryDone (no pending) goes live.
+	// The follow-up replay re-delivers the range. Flags are delivery-time
+	// annotations, so a CLEAN re-delivery carries no flags; HistoryDone
+	// (nothing pending) goes live.
 	w.Dispatch([]FSEvent{
 		{Path: "/watched/c", Flags: uint32(FSEventsCreated | FSEventsIsFile), ID: 15},
-		{Path: "/watched/b", Flags: ud, ID: 20},
+		{Path: "/watched/b", Flags: uint32(FSEventsCreated | FSEventsIsFile), ID: 20},
 		{Flags: uint32(FSEventsHistoryDone), ID: 31},
 	})
 	if !w.live {
-		t.Fatal("watch not live after follow-up HistoryDone")
+		t.Fatal("watch not live after clean follow-up HistoryDone")
 	}
 	if heals != 1 {
-		t.Fatalf("stripped re-delivery must not re-heal, heals=%d", heals)
+		t.Fatalf("clean re-delivery must not re-heal, heals=%d", heals)
 	}
 
 	close(c)
@@ -444,8 +461,54 @@ func TestDispatchHealsMidReplayFlag(t *testing.T) {
 	want := []string{
 		"notify.Create /watched/a",
 		"notify.Create /watched/c",
+		"notify.Create /watched/b",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("forwarded events:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestDispatchLossyReplayForwardsOneRootRescan(t *testing.T) {
+	// A replay that collects maxSurgicalHoles or more drop holes is too
+	// lossy for surgical follow-ups: HistoryDone forwards ONE root rescan
+	// (consumer full-scan) instead of restarting the stream.
+	replayHistorical.Store(true)
+	defer replayHistorical.Store(false)
+
+	c := make(chan EventInfo, 2*maxSurgicalHoles)
+	var heals int
+	w := &watch{
+		c:       c,
+		path:    "/watched",
+		events:  uint32(Create | FSEventsMustScanSubDirs | FSEventsUserDropped | FSEventsKernelDropped),
+		isrec:   1,
+		flushed: true,
+	}
+	w.restartStream = func(uint64) error { heals++; return nil }
+	ud := uint32(FSEventsUserDropped | FSEventsMustScanSubDirs)
+
+	w.Dispatch([]FSEvent{{Path: "/watched/a", Flags: uint32(FSEventsCreated | FSEventsIsFile), ID: 1}})
+	batch := make([]FSEvent, 0, maxSurgicalHoles+1)
+	for i := 0; i < maxSurgicalHoles; i++ {
+		batch = append(batch, FSEvent{Path: "/watched/x", Flags: ud, ID: uint64(10 + i)})
+	}
+	batch = append(batch, FSEvent{Flags: uint32(FSEventsHistoryDone), ID: 100})
+	w.Dispatch(batch)
+
+	if heals != 0 {
+		t.Fatalf("lossy replay must not trigger a surgical follow-up, heals=%d", heals)
+	}
+	var rootRescans int
+	close(c)
+	for ei := range c {
+		if ei.Event()&FSEventsMustScanSubDirs != 0 {
+			rootRescans++
+		}
+	}
+	if rootRescans != 1 {
+		t.Fatalf("want exactly one root rescan forwarded, got %d", rootRescans)
+	}
+	if !w.flushed {
+		t.Fatal("HistoryDone must still mark the stream flushed")
 	}
 }

@@ -134,6 +134,7 @@ type watch struct {
 	// per completed replay; hasPending marks the pair valid.
 	pendingFrom   uint64
 	pendingTarget uint64
+	pendingCount  int
 	hasPending    bool
 	// restartStream restarts the watch's stream replaying from the given
 	// journal ID. Set by fsevents.watch; a field so tests can stub it.
@@ -237,9 +238,16 @@ func (w *watch) heal(targetID uint64) bool {
 	return w.healFrom(w.lastID.Load(), targetID)
 }
 
-// healFrom restarts the stream replaying from fromID, treating records up
-// to targetID as covered by the replay (their drop flags are stripped on
-// re-delivery).
+// maxSurgicalHoles bounds how many mid-replay drop holes justify a surgical
+// follow-up replay. Beyond it the replay is lossy enough that each follow-up
+// would re-replay millions of records and collect fresh holes; one consumer
+// full-scan is cheaper and terminal.
+const maxSurgicalHoles = 64
+
+// healFrom restarts the stream replaying from fromID; targetID is the
+// highest flagged ID the replay covers (kept for diagnostics). Drop flags
+// are delivery-time annotations, so any flagged record the replay delivers
+// marks a fresh hole and is collected for the next follow-up.
 func (w *watch) healFrom(fromID, targetID uint64) bool {
 	if w.restartStream == nil {
 		healprintf("heal ABORT path=%s target=%d: no restartStream\n", w.path, targetID)
@@ -254,6 +262,7 @@ func (w *watch) healFrom(fromID, targetID uint64) bool {
 	w.live = false // set back on the restarted stream's HistoryDone
 	w.delivered = false
 	w.hasPending = false
+	w.pendingCount = 0
 	healprintf("heal OK path=%s target=%d replay from=%d\n", w.path, targetID, fromID)
 	return true
 }
@@ -275,14 +284,27 @@ func (w *watch) Dispatch(ev []FSEvent) {
 		if ev[i].Flags&FSEventsHistoryDone != 0 {
 			w.flushed = true
 			if w.hasPending && !w.healDisabled {
+				from, target, count := w.pendingFrom, w.pendingTarget, w.pendingCount
+				w.hasPending = false
+				w.pendingCount = 0
+				if count >= maxSurgicalHoles {
+					// The replay was too lossy for surgical hole-chasing:
+					// each follow-up would re-replay millions of records
+					// and collect fresh holes. One consumer full-scan
+					// re-establishes completeness instead.
+					healprintf("replay too lossy path=%s holes=%d: forwarding one root rescan\n", w.path, count)
+					select {
+					case w.c <- &event{fse: FSEvent{Path: w.path, Flags: uint32(FSEventsMustScanSubDirs)}, event: FSEventsMustScanSubDirs}:
+					default:
+					}
+					continue
+				}
 				// The replay finished; start the single follow-up replay
 				// covering every hole this replay flagged. On failure the
 				// stripped flags must not vanish: forward a synthetic root
 				// rescan (the flushDropped contract) so the consumer
 				// full-scans.
-				from, target := w.pendingFrom, w.pendingTarget
-				w.hasPending = false
-				healprintf("follow-up heal path=%s from=%d target=%d\n", w.path, from, target)
+				healprintf("follow-up heal path=%s from=%d target=%d holes=%d\n", w.path, from, target, count)
 				if !w.healFrom(from, target) {
 					select {
 					case w.c <- &event{fse: FSEvent{Path: w.path, Flags: uint32(FSEventsMustScanSubDirs)}, event: FSEventsMustScanSubDirs}:
@@ -304,13 +326,6 @@ func (w *watch) Dispatch(ev []FSEvent) {
 			if flags&uint32(FSEventsUserDropped) != 0 {
 				target := w.healTargetID.Load()
 				switch {
-				case ev[i].ID <= target:
-					// Arriving via a heal replay: the drop flags latched on
-					// this record refer to the gap the replay is covering.
-					// Strip them; any real content flows through the normal
-					// path below, and any remaining failure flags (e.g.
-					// KernelDropped) are still forwarded.
-					ev[i].Flags &^= uint32(FSEventsUserDropped | FSEventsMustScanSubDirs)
 				case !w.healDisabled && replayHistorical.Load() && w.live:
 					// fseventsd dropped deliveries for this stream. The
 					// journal holds the events; heal by replaying the gap
@@ -324,12 +339,16 @@ func (w *watch) Dispatch(ev []FSEvent) {
 					}
 					// Heal failed: forward the flags (consumer full-scans).
 				case !w.healDisabled && replayHistorical.Load() && w.delivered:
-					// Drop mid-replay: the hole sits inside the replayed
-					// range and the journal holds it. Restarting per flag
+					// Drop mid-replay. Drop flags are delivery-time
+					// annotations, not journaled (measured 2026-10-11:
+					// flagged records sit at fresh delivery holes, and zero
+					// flagged IDs reappear across replay rounds), so EVERY
+					// mid-replay flag marks a hole in THIS delivery,
+					// regardless of ID. Strip and collect for ONE deferred
+					// follow-up heal at HistoryDone - restarting per flag
 					// stormed (measured 1757 restarts in 10 min without
-					// converging), so strip the flags and defer ONE
-					// follow-up heal to HistoryDone, replaying from the
-					// earliest hole start. The flagged record itself flows
+					// converging), and forwarding each flag fed the
+					// consumer's full-scan loop. The flagged record flows
 					// on with any real content.
 					if !w.hasPending {
 						w.pendingFrom = w.lastID.Load()
@@ -338,6 +357,7 @@ func (w *watch) Dispatch(ev []FSEvent) {
 					} else if ev[i].ID > w.pendingTarget {
 						w.pendingTarget = ev[i].ID
 					}
+					w.pendingCount++
 					healprintf("mid-replay flag DEFERRED path=%s ID=%d hole from=%d\n", w.path, ev[i].ID, w.pendingFrom)
 					ev[i].Flags &^= uint32(FSEventsUserDropped | FSEventsMustScanSubDirs)
 				default:
