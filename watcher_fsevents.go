@@ -219,14 +219,18 @@ func (w *watch) flushDropped() {
 // consumer heals with a full rescan instead.
 func (w *watch) heal(targetID uint64) bool {
 	if w.restartStream == nil {
+		healprintf("heal ABORT path=%s target=%d: no restartStream\n", w.path, targetID)
 		return false
 	}
 	w.healTargetID.Store(targetID)
-	if err := w.restartStream(w.lastID.Load()); err != nil {
+	fromID := w.lastID.Load()
+	if err := w.restartStream(fromID); err != nil {
 		w.healDisabled = true
+		healprintf("heal FAILED path=%s target=%d from=%d: %v\n", w.path, targetID, fromID, err)
 		return false
 	}
 	w.live = false // set back on the restarted stream's HistoryDone
+	healprintf("heal OK path=%s target=%d replay from=%d\n", w.path, targetID, fromID)
 	return true
 }
 
@@ -247,6 +251,7 @@ func (w *watch) Dispatch(ev []FSEvent) {
 		if ev[i].Flags&FSEventsHistoryDone != 0 {
 			w.flushed = true
 			w.live = true
+			healprintf("HistoryDone path=%s ID=%d live=true\n", w.path, ev[i].ID)
 			continue
 		}
 		if !w.flushed && !replayHistorical.Load() {
@@ -277,6 +282,9 @@ func (w *watch) Dispatch(ev []FSEvent) {
 						return
 					}
 					// Heal failed: forward the flags (consumer full-scans).
+				default:
+					healprintf("flag FORWARDED path=%s ID=%d flags=0x%x target=%d live=%v healDisabled=%v replayHistorical=%v\n",
+						w.path, ev[i].ID, ev[i].Flags, target, w.live, w.healDisabled, replayHistorical.Load())
 				}
 			}
 			if ev[i].Flags&failure != 0 && failure&events == 0 {

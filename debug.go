@@ -17,6 +17,21 @@ var dbgprintf func(string, ...interface{})
 
 var dbgcallstack func(max int) []string
 
+// healprintf logs fsevents heal-by-replay decisions (heal attempts,
+// HistoryDone, forwarded drop flags). Low volume, gated on NOTIFY_DEBUG_HEAL
+// independently of the NOTIFY_DEBUG per-event firehose.
+var healprintf func(string, ...interface{})
+
+func init() {
+	if _, ok := os.LookupEnv("NOTIFY_DEBUG_HEAL"); ok {
+		healprintf = func(format string, v ...interface{}) {
+			log.Printf("[heal] "+format, v...)
+		}
+	} else {
+		healprintf = func(string, ...interface{}) {}
+	}
+}
+
 func init() {
 	if _, ok := os.LookupEnv("NOTIFY_DEBUG"); ok || debugTag {
 		log.SetOutput(os.Stdout)
