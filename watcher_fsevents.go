@@ -111,11 +111,18 @@ type watch struct {
 	// them into coalesced records), so they are stripped, not re-healed.
 	healTargetID atomic.Uint64
 	// live is true once the stream finished its initial historical replay
-	// (HistoryDone observed since the last stream start). Only live flagged
-	// events trigger heals; flagged events in a boot replay are forwarded
-	// so the consumer full-scans (the journal may genuinely not cover the
-	// persisted seed).
+	// (HistoryDone observed since the last stream start).
 	live bool
+	// delivered is true once this stream incarnation has examined at least
+	// one event, which proves the journal reaches the stream's start
+	// position. A flagged event during a replay with delivered set marks a
+	// hole inside the replayed range - the journal holds those events, so
+	// the watch heals from the last examined ID instead of forwarding the
+	// flag (which costs the consumer a full rescan). A flagged event with
+	// delivered unset is the replay's very first record: its gap may extend
+	// below the requested start (journal genuinely shorter than the seed),
+	// so it is forwarded for a full scan.
+	delivered bool
 	// healDisabled is set when a heal's stream restart fails; flagged
 	// events then fall back to being forwarded (consumer full-scan).
 	healDisabled bool
@@ -230,6 +237,7 @@ func (w *watch) heal(targetID uint64) bool {
 		return false
 	}
 	w.live = false // set back on the restarted stream's HistoryDone
+	w.delivered = false
 	healprintf("heal OK path=%s target=%d replay from=%d\n", w.path, targetID, fromID)
 	return true
 }
@@ -270,7 +278,7 @@ func (w *watch) Dispatch(ev []FSEvent) {
 					// path below, and any remaining failure flags (e.g.
 					// KernelDropped) are still forwarded.
 					ev[i].Flags &^= uint32(FSEventsUserDropped | FSEventsMustScanSubDirs)
-				case w.live && !w.healDisabled && replayHistorical.Load():
+				case !w.healDisabled && replayHistorical.Load() && (w.live || w.delivered):
 					// fseventsd dropped deliveries for this stream. The
 					// journal holds the events; heal by replaying the gap
 					// instead of making the consumer full-scan. The rest of
@@ -278,6 +286,18 @@ func (w *watch) Dispatch(ev []FSEvent) {
 					// Requires replayHistorical: a heal's replayed events
 					// are historical, so without it they would be dropped
 					// at the gate above and the gap would be lost.
+					//
+					// w.live covers drops on the live stream; w.delivered
+					// covers drops mid-replay (measured 2026-10-11: replays
+					// of tens of thousands of events reliably take
+					// UserDropped holes, and forwarding each one fed the
+					// consumer's full-scan loop). Mid-replay the last
+					// examined ID is exactly the hole start, so the heal
+					// replay re-covers it. A flagged first record of a
+					// replay (delivered unset) is NOT healed: its gap may
+					// extend below the requested start (journal shorter
+					// than the seed), which only a consumer full-scan
+					// covers.
 					if w.heal(ev[i].ID) {
 						return
 					}
@@ -294,8 +314,10 @@ func (w *watch) Dispatch(ev []FSEvent) {
 		}
 		// The event has been examined (forwarded, filtered or deliberately
 		// suppressed); a heal replay starts after it, so only events Dispatch
-		// never saw are re-delivered.
+		// never saw are re-delivered. Examining anything at all also proves
+		// the journal reaches this stream's start position.
 		w.lastID.Store(ev[i].ID)
+		w.delivered = true
 		if !strings.HasPrefix(ev[i].Path, w.path) {
 			continue
 		}
