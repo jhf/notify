@@ -171,6 +171,10 @@ type stream struct {
 	path string
 	ref  C.FSEventStreamRef
 	info uintptr
+	// sinceID, when nonzero, pins the journal position this stream starts
+	// from, overriding the package-level seed (used by watch heals, which
+	// replay a known gap without disturbing other watches).
+	sinceID uint64
 }
 
 // NewStream creates a stream for given path, listening for file events and
@@ -182,6 +186,13 @@ func newStream(path string, fn streamFunc) *stream {
 	}
 }
 
+// newStreamSince is newStream with an explicit journal start position.
+func newStreamSince(path string, fn streamFunc, sinceID uint64) *stream {
+	s := newStream(path, fn)
+	s.sinceID = sinceID
+	return s
+}
+
 // Start creates a FSEventStream for the given path and schedules on the global dispatch queue.
 // It's a nop if the stream was already started.
 func (s *stream) Start() error {
@@ -191,7 +202,11 @@ func (s *stream) Start() error {
 	p := C.CFStringCreateWithCStringNoCopy(C.kCFAllocatorDefault, C.CString(s.path), C.kCFStringEncodingUTF8, C.kCFAllocatorDefault)
 	path := C.CFArrayCreate(C.kCFAllocatorDefault, (*unsafe.Pointer)(unsafe.Pointer(&p)), 1, nil)
 	ctx := C.FSEventStreamContext{}
-	ref := C.EventStreamCreate(&ctx, C.uintptr_t(s.info), path, C.FSEventStreamEventId(atomic.LoadUint64(&since)), latency, flags)
+	sinceID := s.sinceID
+	if sinceID == 0 {
+		sinceID = atomic.LoadUint64(&since)
+	}
+	ref := C.EventStreamCreate(&ctx, C.uintptr_t(s.info), path, C.FSEventStreamEventId(sinceID), latency, flags)
 	if ref == nilstream {
 		return errCreate
 	}

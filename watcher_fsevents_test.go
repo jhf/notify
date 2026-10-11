@@ -267,3 +267,107 @@ func TestDispatchDropsWithSyntheticFlag(t *testing.T) {
 		t.Fatalf("dropped count not reset: %d", w.dropped.Load())
 	}
 }
+
+func TestDispatchHealsUserDroppedByReplay(t *testing.T) {
+	// A live UserDropped flag must restart the stream replaying from the
+	// last examined event ID, must not be forwarded (the consumer must not
+	// full-scan), and records re-delivered by the heal replay must have
+	// their latched drop flags stripped while keeping real content.
+	replayHistorical.Store(true)
+	defer replayHistorical.Store(false)
+
+	c := make(chan EventInfo, 64)
+	var heals int
+	var healFrom uint64
+	w := &watch{
+		c:       c,
+		path:    "/watched",
+		events:  uint32(Create | Remove | Rename | FSEventsMustScanSubDirs | FSEventsUserDropped | FSEventsKernelDropped),
+		isrec:   1,
+		flushed: true,
+		live:    true,
+	}
+	w.restartStream = func(sinceID uint64) error {
+		heals++
+		healFrom = sinceID
+		return nil
+	}
+	ud := uint32(FSEventsUserDropped | FSEventsMustScanSubDirs)
+
+	// Normal live event: forwarded, lastID advances.
+	w.Dispatch([]FSEvent{{Path: "/watched/a", Flags: uint32(FSEventsCreated | FSEventsIsFile), ID: 100}})
+	// Live flagged event: heal from 100, nothing forwarded for it.
+	w.Dispatch([]FSEvent{{Path: "/watched/b", Flags: ud | uint32(FSEventsCreated|FSEventsIsFile), ID: 105}})
+	if heals != 1 || healFrom != 100 {
+		t.Fatalf("want one heal from ID 100, got heals=%d from=%d", heals, healFrom)
+	}
+	if w.live {
+		t.Fatal("watch still live after heal")
+	}
+	// Heal replay: a plain historical event, then the flagged record itself
+	// (ID <= target: flags stripped, content kept), then HistoryDone.
+	w.Dispatch([]FSEvent{
+		{Path: "/watched/c", Flags: uint32(FSEventsCreated | FSEventsIsFile), ID: 101},
+		{Path: "/watched/b", Flags: ud | uint32(FSEventsCreated|FSEventsIsFile), ID: 105},
+		{Flags: uint32(FSEventsHistoryDone), ID: 106},
+	})
+	if !w.live {
+		t.Fatal("watch not live after HistoryDone")
+	}
+	// A second live drop heals again, from the last examined ID.
+	w.Dispatch([]FSEvent{{Path: "/watched/d", Flags: ud, ID: 200}})
+	if heals != 2 || healFrom != 105 {
+		t.Fatalf("want second heal from ID 105, got heals=%d from=%d", heals, healFrom)
+	}
+
+	close(c)
+	var got []string
+	for ei := range c {
+		got = append(got, ei.Event().String()+" "+ei.Path())
+	}
+	want := []string{
+		"notify.Create /watched/a",
+		"notify.Create /watched/c",
+		"notify.Create /watched/b",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("forwarded events:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestDispatchForwardsBootReplayFlags(t *testing.T) {
+	// Conservative boot path: flagged events arriving before the stream's
+	// first HistoryDone are forwarded unchanged (the journal may genuinely
+	// not cover the persisted seed), and do not trigger heals.
+	replayHistorical.Store(true)
+	defer replayHistorical.Store(false)
+
+	c := make(chan EventInfo, 64)
+	w := &watch{
+		c:       c,
+		path:    "/watched",
+		events:  uint32(Create | FSEventsMustScanSubDirs | FSEventsUserDropped | FSEventsKernelDropped),
+		isrec:   1,
+		flushed: true,
+		live:    false,
+	}
+	w.restartStream = func(uint64) error {
+		t.Error("heal must not trigger before the stream is live")
+		return nil
+	}
+	ud := uint32(FSEventsUserDropped | FSEventsMustScanSubDirs)
+	w.Dispatch([]FSEvent{{Path: "/watched/x", Flags: ud, ID: 50}})
+	close(c)
+	var got []Event
+	for ei := range c {
+		got = append(got, ei.Event())
+	}
+	if len(got) == 0 {
+		t.Fatal("boot replay flag was swallowed; consumer would never full-scan")
+	}
+	for _, e := range got {
+		if e&(FSEventsMustScanSubDirs|FSEventsUserDropped) == 0 {
+			t.Fatalf("unexpected event forwarded: %v", e)
+		}
+	}
+}

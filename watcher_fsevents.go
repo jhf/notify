@@ -100,6 +100,28 @@ type watch struct {
 	// rescans instead of silently missing the dropped events (the same
 	// contract fseventsd itself uses).
 	dropped atomic.Int64
+	// lastID is the highest journal ID Dispatch has examined. A heal replay
+	// starts here, so it re-delivers exactly the events fseventsd dropped
+	// (a UserDropped flag means the client failed to read; the on-disk
+	// journal still holds the events).
+	lastID atomic.Uint64
+	// healTargetID is the journal ID of the flagged event the in-flight
+	// heal covers. Flagged events with ID <= healTargetID arrive via the
+	// heal's own replay: their drop flags are latched junk (fseventsd merges
+	// them into coalesced records), so they are stripped, not re-healed.
+	healTargetID atomic.Uint64
+	// live is true once the stream finished its initial historical replay
+	// (HistoryDone observed since the last stream start). Only live flagged
+	// events trigger heals; flagged events in a boot replay are forwarded
+	// so the consumer full-scans (the journal may genuinely not cover the
+	// persisted seed).
+	live bool
+	// healDisabled is set when a heal's stream restart fails; flagged
+	// events then fall back to being forwarded (consumer full-scan).
+	healDisabled bool
+	// restartStream restarts the watch's stream replaying from the given
+	// journal ID. Set by fsevents.watch; a field so tests can stub it.
+	restartStream func(sinceID uint64) error
 }
 
 // Example format:
@@ -187,6 +209,27 @@ func (w *watch) flushDropped() {
 	}
 }
 
+// heal restarts the watch's stream replaying the journal from the last
+// examined event ID. fseventsd journals events before delivering them, so a
+// UserDropped flag means the client failed to read events that the journal
+// still holds: the replay re-delivers exactly the dropped range, in order,
+// and the flagged record itself (its drop flags are stripped on the way
+// through Dispatch since they refer to the gap being healed). Returns false
+// if the restart failed; the caller then forwards the flagged event so the
+// consumer heals with a full rescan instead.
+func (w *watch) heal(targetID uint64) bool {
+	if w.restartStream == nil {
+		return false
+	}
+	w.healTargetID.Store(targetID)
+	if err := w.restartStream(w.lastID.Load()); err != nil {
+		w.healDisabled = true
+		return false
+	}
+	w.live = false // set back on the restarted stream's HistoryDone
+	return true
+}
+
 // Dispatch is a stream function which forwards given file events for the watched
 // path to underlying FileInfo channel.
 //
@@ -203,6 +246,7 @@ func (w *watch) Dispatch(ev []FSEvent) {
 	for i := range ev {
 		if ev[i].Flags&FSEventsHistoryDone != 0 {
 			w.flushed = true
+			w.live = true
 			continue
 		}
 		if !w.flushed && !replayHistorical.Load() {
@@ -210,10 +254,40 @@ func (w *watch) Dispatch(ev []FSEvent) {
 		}
 		dbgprintf("%v (0x%x) (%s, i=%d, ID=%d, len=%d)\n", Event(ev[i].Flags),
 			ev[i].Flags, ev[i].Path, i, ev[i].ID, len(ev))
-		if ev[i].Flags&failure != 0 && failure&events == 0 {
-			// TODO(rjeczalik): missing error handling
-			continue
+		if flags := ev[i].Flags; flags&failure != 0 {
+			if flags&uint32(FSEventsUserDropped) != 0 {
+				target := w.healTargetID.Load()
+				switch {
+				case ev[i].ID <= target:
+					// Arriving via a heal replay: the drop flags latched on
+					// this record refer to the gap the replay is covering.
+					// Strip them; any real content flows through the normal
+					// path below, and any remaining failure flags (e.g.
+					// KernelDropped) are still forwarded.
+					ev[i].Flags &^= uint32(FSEventsUserDropped | FSEventsMustScanSubDirs)
+				case w.live && !w.healDisabled && replayHistorical.Load():
+					// fseventsd dropped deliveries for this stream. The
+					// journal holds the events; heal by replaying the gap
+					// instead of making the consumer full-scan. The rest of
+					// this batch (IDs beyond the gap) re-arrives via replay.
+					// Requires replayHistorical: a heal's replayed events
+					// are historical, so without it they would be dropped
+					// at the gate above and the gap would be lost.
+					if w.heal(ev[i].ID) {
+						return
+					}
+					// Heal failed: forward the flags (consumer full-scans).
+				}
+			}
+			if ev[i].Flags&failure != 0 && failure&events == 0 {
+				// TODO(rjeczalik): missing error handling
+				continue
+			}
 		}
+		// The event has been examined (forwarded, filtered or deliberately
+		// suppressed); a heal replay starts after it, so only events Dispatch
+		// never saw are re-delivered.
+		w.lastID.Store(ev[i].ID)
 		if !strings.HasPrefix(ev[i].Path, w.path) {
 			continue
 		}
@@ -281,6 +355,11 @@ func (fse *fsevents) watch(path string, event Event, isrec int32) (err error) {
 		path:   path,
 		events: uint32(event),
 		isrec:  isrec,
+	}
+	w.restartStream = func(sinceID uint64) error {
+		w.stream.Stop()
+		w.stream = newStreamSince(w.path, w.Dispatch, sinceID)
+		return w.stream.Start()
 	}
 	w.stream = newStream(path, w.Dispatch)
 	if err = w.stream.Start(); err != nil {
