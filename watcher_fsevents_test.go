@@ -511,4 +511,25 @@ func TestDispatchLossyReplayForwardsOneRootRescan(t *testing.T) {
 	if !w.flushed {
 		t.Fatal("HistoryDone must still mark the stream flushed")
 	}
+	if !w.live {
+		t.Fatal("lossy verdict must restore live: HistoryDone means the stream " +
+			"has caught up; staying live=false defers every later drop flag " +
+			"into a pending set no future HistoryDone ever judges")
+	}
+
+	// After the lossy verdict the stream is live again: the next drop flag
+	// must take the immediate per-flag heal path, not the deferral path.
+	c2 := make(chan EventInfo, 4)
+	w.c = c2
+	w.Dispatch([]FSEvent{{Path: "/watched/y", Flags: ud, ID: 200}})
+	if heals != 1 {
+		t.Fatalf("post-verdict drop flag must heal immediately, heals=%d", heals)
+	}
+	if w.live {
+		t.Fatal("watch must not be live during the new heal replay")
+	}
+	if w.hasPending {
+		t.Fatal("post-verdict drop flag must not be deferred")
+	}
+	close(c2)
 }

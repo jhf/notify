@@ -291,8 +291,16 @@ func (w *watch) Dispatch(ev []FSEvent) {
 					// The replay was too lossy for surgical hole-chasing:
 					// each follow-up would re-replay millions of records
 					// and collect fresh holes. One consumer full-scan
-					// re-establishes completeness instead.
+					// re-establishes completeness instead. HistoryDone
+					// means the stream has caught up, so it is LIVE again:
+					// restoring live is what re-arms immediate per-flag
+					// heals. Without it the watch stuck in live=false
+					// deferred every later drop flag into a pending set no
+					// future HistoryDone would ever judge, silently
+					// suppressing drop signals (observed live 2026-10-12:
+					// 15,627 flags deferred over 57 minutes).
 					healprintf("replay too lossy path=%s holes=%d: forwarding one root rescan\n", w.path, count)
+					w.live = true
 					select {
 					case w.c <- &event{fse: FSEvent{Path: w.path, Flags: uint32(FSEventsMustScanSubDirs)}, event: FSEventsMustScanSubDirs}:
 					default:
