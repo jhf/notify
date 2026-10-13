@@ -34,7 +34,15 @@ var nilstream C.FSEventStreamRef
 
 // Default arguments for FSEventStreamCreate function.
 var (
-	latency C.CFTimeInterval
+	// latency 0 makes fseventsd deliver every micro-batch immediately with
+	// no coalescing; on a busy tree (measured ~1000 events/sec on a
+	// 2.4M-file home dir, 2026-10-13) that kept fseventsd at >100% CPU
+	// sustained and the consumer at ~80%. 1s lets fseventsd coalesce the
+	// flood into one delivery per second. Consumers that batch downstream
+	// anyway (syncthing's aggregator delays 10s by default) see no change
+	// in end-to-end latency. NoDefer still applies, so historical replays
+	// (heals, boot replay) are delivered without this delay.
+	latency = C.CFTimeInterval(1.0)
 	flags   = C.FSEventStreamCreateFlags(C.kFSEventStreamCreateFlagFileEvents | C.kFSEventStreamCreateFlagNoDefer)
 	since   = uint64(C.FSEventsGetCurrentEventId())
 )
