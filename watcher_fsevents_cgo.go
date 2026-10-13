@@ -12,11 +12,17 @@ package notify
 #include <dispatch/dispatch.h>
 
 void gostream(uintptr_t, uintptr_t, size_t, uintptr_t, uintptr_t, uintptr_t);
+void goPollFire(uintptr_t);
 
 static FSEventStreamRef EventStreamCreate(FSEventStreamContext * context, uintptr_t info, CFArrayRef paths, FSEventStreamEventId since, CFTimeInterval latency, FSEventStreamCreateFlags flags) {
 	context->info = (void*) info;
 	return FSEventStreamCreate(NULL, (FSEventStreamCallback) gostream, context, paths, since, latency, flags);
 }
+
+// dispatchPoll posts h onto the serial queue all streams dispatch on, so a
+// poll-mode timer restart is serialized with event dispatch.
+static void pollfire(void *ctx) { goPollFire((uintptr_t)ctx); }
+static void dispatchPoll(dispatch_queue_t qq, uintptr_t h) { dispatch_async_f(qq, (void*)h, pollfire); }
 
 #cgo LDFLAGS: -framework CoreServices
 */
@@ -25,8 +31,10 @@ import "C"
 import (
 	"errors"
 	"os"
+	"runtime/cgo"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
@@ -111,6 +119,45 @@ var (
 	errCreate = os.NewSyscallError("FSEventStreamCreate", errors.New("NULL"))
 	errStart  = os.NewSyscallError("FSEventStreamStart", errors.New("false"))
 )
+
+//export goPollFire
+func goPollFire(h C.uintptr_t) {
+	handle := cgo.Handle(h)
+	fn := handle.Value().(func())
+	handle.Delete()
+	fn()
+}
+
+// schedulePollRestart restarts w's stream from fromID after d, serialized
+// with event dispatch: the timer only posts onto the serial queue, and the
+// queued closure checks it was not superseded by a newer poll or a Stop.
+func (w *watch) schedulePollRestart(fromID uint64, d time.Duration) {
+	w.pollGen++
+	gen := w.pollGen
+	time.AfterFunc(d, func() {
+		h := cgo.NewHandle(func() {
+			if gen != w.pollGen || atomic.LoadUint32(&w.events) == 0 {
+				return
+			}
+			w.live = false
+			w.replaying = true
+			w.delivered = false
+			w.hasPending = false
+			w.pendingCount = 0
+			if err := w.restartStream(fromID); err != nil {
+				w.healDisabled = true
+				healprintf("poll restart FAILED path=%s from=%d: %v\n", w.path, fromID, err)
+				// The poll chain is dead; make the consumer full-scan, its
+				// completion re-arms and restarts the watch.
+				select {
+				case w.c <- &event{fse: FSEvent{Path: w.path, Flags: uint32(FSEventsMustScanSubDirs)}, event: FSEventsMustScanSubDirs}:
+				default:
+				}
+			}
+		})
+		C.dispatchPoll(q, C.uintptr_t(h))
+	})
+}
 
 //export gostream
 func gostream(_, info uintptr, n C.size_t, paths, flags, ids uintptr) {

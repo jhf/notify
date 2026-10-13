@@ -8,10 +8,10 @@
 package notify
 
 import (
-	"time"
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestSplitflags(t *testing.T) {
@@ -404,12 +404,13 @@ func TestDispatchHealsMidReplayFlag(t *testing.T) {
 	var heals int
 	var healFrom, healTarget uint64
 	w := &watch{
-		c:       c,
-		path:    "/watched",
-		events:  uint32(Create | FSEventsMustScanSubDirs | FSEventsUserDropped | FSEventsKernelDropped),
-		isrec:   1,
-		flushed: true,
-		live:    false, // mid boot replay: no HistoryDone yet
+		c:         c,
+		path:      "/watched",
+		events:    uint32(Create | FSEventsMustScanSubDirs | FSEventsUserDropped | FSEventsKernelDropped),
+		isrec:     1,
+		flushed:   true,
+		live:      false, // mid boot replay: no HistoryDone yet
+		replaying: true,  // dev.85 gate: replay-time flags defer
 	}
 	w.restartStream = func(sinceID uint64) error {
 		heals++
@@ -478,11 +479,12 @@ func TestDispatchLossyReplayForwardsOneRootRescan(t *testing.T) {
 	c := make(chan EventInfo, 2*maxSurgicalHoles)
 	var heals int
 	w := &watch{
-		c:       c,
-		path:    "/watched",
-		events:  uint32(Create | FSEventsMustScanSubDirs | FSEventsUserDropped | FSEventsKernelDropped),
-		isrec:   1,
-		flushed: true,
+		c:         c,
+		path:      "/watched",
+		events:    uint32(Create | FSEventsMustScanSubDirs | FSEventsUserDropped | FSEventsKernelDropped),
+		isrec:     1,
+		flushed:   true,
+		replaying: true,
 	}
 	w.restartStream = func(uint64) error { heals++; return nil }
 	ud := uint32(FSEventsUserDropped | FSEventsMustScanSubDirs)

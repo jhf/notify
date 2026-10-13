@@ -11,6 +11,7 @@ import (
 	"errors"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 const (
@@ -149,6 +150,12 @@ type watch struct {
 	// restartStream restarts the watch's stream replaying from the given
 	// journal ID. Set by fsevents.watch; a field so tests can stub it.
 	restartStream func(sinceID uint64) error
+	// scheduleRestart restarts the stream from the given ID after the poll
+	// interval (poll mode). Set by fsevents.watch; a field so tests can
+	// stub it.
+	scheduleRestart func(fromID uint64, d time.Duration)
+	// pollGen invalidates superseded poll restart timers.
+	pollGen int
 }
 
 // Example format:
@@ -295,6 +302,10 @@ func (w *watch) Dispatch(ev []FSEvent) {
 		if ev[i].Flags&FSEventsHistoryDone != 0 {
 			w.flushed = true
 			w.replaying = false
+			if d := PollInterval(); d > 0 {
+				w.pollHistoryDone(ev[i].ID, d)
+				continue
+			}
 			if w.hasPending && !w.healDisabled {
 				from, target, count := w.pendingFrom, w.pendingTarget, w.pendingCount
 				w.hasPending = false
@@ -471,6 +482,7 @@ func (fse *fsevents) watch(path string, event Event, isrec int32) (err error) {
 		w.stream = newStreamSince(w.path, w.Dispatch, sinceID)
 		return w.stream.Start()
 	}
+	w.scheduleRestart = w.schedulePollRestart
 	w.stream = newStream(path, w.Dispatch)
 	if err = w.stream.Start(); err != nil {
 		return err
