@@ -67,6 +67,13 @@ func SetSinceEventID(id uint64) {
 	replayHistorical.Store(true)
 }
 
+// ReplayEnabled reports whether historical event processing is currently
+// armed, i.e. whether a live drop flag will be healed by journal replay
+// rather than forwarded to the consumer for a full rescan.
+func ReplayEnabled() bool {
+	return replayHistorical.Load()
+}
+
 // ResetSinceEventID abandons journal replay: the seed is raised to the
 // current event ID and historical events are dropped again. Callers use this
 // when the journal turns out not to cover the seeded position (signalled by
