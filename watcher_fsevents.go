@@ -113,6 +113,16 @@ type watch struct {
 	// live is true once the stream finished its initial historical replay
 	// (HistoryDone observed since the last stream start).
 	live bool
+	// replaying is true from a heal's stream restart until that stream's
+	// HistoryDone. Drop flags anywhere in the replay - including the startup
+	// window before the first replayed record - mark delivery holes whose
+	// events the journal holds (measured 2026-10-11: zero flagged IDs
+	// reappear across replay rounds), so they defer to the follow-up heal at
+	// HistoryDone rather than forwarding; each forward costs the consumer a
+	// full scan (measured 2026-10-13: 32 forwarded flags in 45 minutes on a
+	// busy tree, all in replay startup windows). A stream started without
+	// history never sets replaying, so its drop flags still forward.
+	replaying bool
 	// delivered is true once this stream incarnation has examined at least
 	// one event, which proves the journal reaches the stream's start
 	// position. A flagged event during a replay with delivered set marks a
@@ -260,6 +270,7 @@ func (w *watch) healFrom(fromID, targetID uint64) bool {
 		return false
 	}
 	w.live = false // set back on the restarted stream's HistoryDone
+	w.replaying = true
 	w.delivered = false
 	w.hasPending = false
 	w.pendingCount = 0
@@ -283,6 +294,7 @@ func (w *watch) Dispatch(ev []FSEvent) {
 	for i := range ev {
 		if ev[i].Flags&FSEventsHistoryDone != 0 {
 			w.flushed = true
+			w.replaying = false
 			if w.hasPending && !w.healDisabled {
 				from, target, count := w.pendingFrom, w.pendingTarget, w.pendingCount
 				w.hasPending = false
@@ -346,18 +358,20 @@ func (w *watch) Dispatch(ev []FSEvent) {
 						return
 					}
 					// Heal failed: forward the flags (consumer full-scans).
-				case !w.healDisabled && replayHistorical.Load() && w.delivered:
-					// Drop mid-replay. Drop flags are delivery-time
+				case !w.healDisabled && replayHistorical.Load() && w.replaying:
+					// Drop during a heal's replay. Drop flags are delivery-time
 					// annotations, not journaled (measured 2026-10-11:
 					// flagged records sit at fresh delivery holes, and zero
 					// flagged IDs reappear across replay rounds), so EVERY
-					// mid-replay flag marks a hole in THIS delivery,
-					// regardless of ID. Strip and collect for ONE deferred
-					// follow-up heal at HistoryDone - restarting per flag
-					// stormed (measured 1757 restarts in 10 min without
-					// converging), and forwarding each flag fed the
-					// consumer's full-scan loop. The flagged record flows
-					// on with any real content.
+					// replay-time flag marks a hole in THIS delivery, including
+					// the startup window before the first replayed record (the
+					// old stream's lastID still bounds the hole from below).
+					// Strip and collect for ONE deferred follow-up heal at
+					// HistoryDone - restarting per flag stormed (measured 1757
+					// restarts in 10 min without converging), and forwarding
+					// each flag fed the consumer's full-scan loop (measured
+					// 2026-10-13: 32 forwards in 45 min). The flagged record
+					// flows on with any real content.
 					if !w.hasPending {
 						w.pendingFrom = w.lastID.Load()
 						w.pendingTarget = ev[i].ID
