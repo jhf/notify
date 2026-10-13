@@ -43,7 +43,7 @@ var (
 	// in end-to-end latency. NoDefer still applies, so historical replays
 	// (heals, boot replay) are delivered without this delay.
 	latency = C.CFTimeInterval(1.0)
-	flags   = C.FSEventStreamCreateFlags(C.kFSEventStreamCreateFlagFileEvents | C.kFSEventStreamCreateFlagNoDefer)
+	flags   = C.FSEventStreamCreateFlags(C.kFSEventStreamCreateFlagFileEvents | C.kFSEventStreamCreateFlagNoDefer | C.kFSEventStreamCreateFlagIgnoreSelf)
 	since   = uint64(C.FSEventsGetCurrentEventId())
 )
 
