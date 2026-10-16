@@ -51,9 +51,36 @@ var (
 	// in end-to-end latency. NoDefer still applies, so historical replays
 	// (heals, boot replay) are delivered without this delay.
 	latency = C.CFTimeInterval(1.0)
-	flags   = C.FSEventStreamCreateFlags(C.kFSEventStreamCreateFlagFileEvents | C.kFSEventStreamCreateFlagNoDefer | C.kFSEventStreamCreateFlagIgnoreSelf)
 	since   = uint64(C.FSEventsGetCurrentEventId())
 )
+
+// ignoreSelf gates kFSEventStreamCreateFlagIgnoreSelf at stream creation.
+// Default off (upstream semantics: self-writes are delivered). A consumer
+// that already knows its own writes (syncthing: its database inside the
+// watched tree and every pulled file) opts in via SetIgnoreSelf and skips
+// that pure-overhead journaling+delivery. Without the opt-in the flag
+// silently breaks any consumer whose own process writes into the watched
+// tree - including every in-process watcher test (observed 2026-10-16:
+// syncthing's lib/fs watcher tests and this package's own tests all time
+// out with the flag unconditional, because the test's writes are
+// self-writes).
+var ignoreSelf atomic.Bool
+
+// SetIgnoreSelf toggles server-side filtering of events caused by this
+// process; affects streams started after the call.
+func SetIgnoreSelf(v bool) {
+	ignoreSelf.Store(v)
+}
+
+// streamFlags computes the FSEventStreamCreate flags at stream creation
+// time, honoring SetIgnoreSelf.
+func streamFlags() C.FSEventStreamCreateFlags {
+	f := C.FSEventStreamCreateFlags(C.kFSEventStreamCreateFlagFileEvents | C.kFSEventStreamCreateFlagNoDefer)
+	if ignoreSelf.Load() {
+		f |= C.kFSEventStreamCreateFlagIgnoreSelf
+	}
+	return f
+}
 
 // replayHistorical gates processing of events that arrive before
 // FSEventsHistoryDone. Those are historical journal events, delivered when a
@@ -268,7 +295,7 @@ func (s *stream) Start() error {
 	if sinceID == 0 {
 		sinceID = atomic.LoadUint64(&since)
 	}
-	ref := C.EventStreamCreate(&ctx, C.uintptr_t(s.info), path, C.FSEventStreamEventId(sinceID), latency, flags)
+	ref := C.EventStreamCreate(&ctx, C.uintptr_t(s.info), path, C.FSEventStreamEventId(sinceID), latency, streamFlags())
 	if ref == nilstream {
 		return errCreate
 	}

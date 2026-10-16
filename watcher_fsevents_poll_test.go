@@ -132,3 +132,14 @@ func TestPollModeDefersHoleToNextPoll(t *testing.T) {
 		t.Fatal("pending hole must be consumed by the scheduling")
 	}
 }
+
+// The fork's 1s stream latency (watcher_fsevents_cgo.go) breaks the phase
+// isolation the shared test cases rely on: with coalescing, an action's
+// events can land in the NEXT phase's expectation window (observed
+// 2026-10-16: TestWatcherRecursiveRewatch got a straggler dir-create from
+// its first block while expecting the second block's file-create). Tests
+// assert delivery semantics, not coalescing, so run them at the upstream
+// latency.
+func init() {
+	latency = 0
+}
